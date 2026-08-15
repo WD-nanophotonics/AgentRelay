@@ -1,0 +1,13 @@
+.venv/
+.codex-cli/
+.runtime-test/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+state/
+logs/
+projects/*/rounds/
+config/projects.yaml
+config/*.oauth.json
+*.sqlite
+.env

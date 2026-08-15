@@ -1,0 +1,25 @@
+runtime:
+  data_root: "%LOCALAPPDATA%/CodexOrchestrator"
+  gmail_oauth_client_filename: "oauth-client.json"
+  gmail_oauth_token_filename: "oauth-token.json"
+  codex_cli_path: ".codex-cli/node_modules/.bin/codex.cmd"
+  poll_interval_seconds: 15
+  gmail_timeout_seconds: 180
+  browser_timeout_seconds: 60
+  # Normal installed Chrome; CDP binds only to 127.0.0.1.
+  chrome_path: ""
+  chrome_profile_dir: "%LOCALAPPDATA%/CodexOrchestrator/profiles/chatgpt"
+  chrome_debug_port: 9222
+  browser_mode: "headful_background"
+  worker_timeout_seconds: 600
+  audit_watchdog_interval_seconds: 60
+  audit_watchdog_max_retries: 1
+projects:
+  dummy_project:
+    mode: dummy
+    local_workspace: "%LOCALAPPDATA%/CodexOrchestrator/dummy-workspaces/dummy_project"
+    auditor_chat_url: "https://chatgpt.com/c/6a7e9537-c1bc-83e8-ab31-8b81fe65b5f4"
+    gmail_subject_prefix: "[ORCH-DUMMY]"
+    # Leave empty to use Gmail users.getProfile after OAuth; never invent an address.
+    worker_email: ""
+    max_rounds: 3

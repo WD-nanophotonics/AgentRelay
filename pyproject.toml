@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dummy-agent-orchestrator"
+version = "0.3.7"
+description = "Durable, multi-project dummy orchestration platform"
+requires-python = ">=3.12"
+dependencies = [
+  "google-api-python-client>=2.0",
+  "google-auth-oauthlib>=1.2",
+  "playwright>=1.48",
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+orchestrator = "dummy_orchestrator.cli:main"
+agent-relay = "dummy_orchestrator.global_cli:main"
+codex-orchestrator = "dummy_orchestrator.global_cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
