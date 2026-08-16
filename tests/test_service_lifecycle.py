@@ -33,7 +33,7 @@ def owned_record(pid: int, generation: str = "test-generation") -> dict[str, obj
     return {"schema": 1, "owner": cli.SERVICE_OWNER, "pid": pid, "generation": generation}
 
 
-def test_t1_stale_dead_pid_is_cleaned_without_starting_any_process(tmp_path: Path, monkeypatch):
+def test_t1_stale_dead_pid_is_cleaned_then_real_supervisor_starts(tmp_path: Path, monkeypatch):
     runtime = tmp_path / "runtime"
     monkeypatch.setenv("LOCALAPPDATA", str(runtime))
     files = service_files(runtime)
@@ -50,8 +50,14 @@ def test_t1_stale_dead_pid_is_cleaned_without_starting_any_process(tmp_path: Pat
     assert not files["ready"].exists()
     assert not files["heartbeat"].exists()
 
+    started = cli.service(service_args("ensure"))
+    assert started["running"] is True
+    assert started["pid"] != record["pid"]
+    assert cli.service(service_args("status"))["running"] is True
+    cli.service(service_args("stop"))
 
-def test_t2_live_foreign_pid_is_never_overwritten_or_stopped(tmp_path: Path, monkeypatch):
+
+def test_ownership_live_foreign_pid_is_never_overwritten_or_stopped(tmp_path: Path, monkeypatch):
     runtime = tmp_path / "runtime"
     monkeypatch.setenv("LOCALAPPDATA", str(runtime))
     files = service_files(runtime)
@@ -66,7 +72,7 @@ def test_t2_live_foreign_pid_is_never_overwritten_or_stopped(tmp_path: Path, mon
     assert json.loads(files["pid"].read_text(encoding="utf-8")) == foreign
 
 
-def test_t3_start_requires_matching_ready_and_heartbeat(tmp_path: Path, monkeypatch):
+def test_t2_immediate_death_does_not_report_running(tmp_path: Path, monkeypatch):
     runtime = tmp_path / "runtime"
     monkeypatch.setenv("LOCALAPPDATA", str(runtime))
     monkeypatch.setattr(cli, "SERVICE_START_TIMEOUT_SECONDS", 0.01)
@@ -84,7 +90,16 @@ def test_t3_start_requires_matching_ready_and_heartbeat(tmp_path: Path, monkeypa
     assert not (runtime / "CodexOrchestrator" / "service" / "supervisor.pid").exists()
 
 
-def test_t4_start_lock_has_bounded_failure(tmp_path: Path, monkeypatch):
+def test_t3_normal_clean_start(tmp_path: Path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("LOCALAPPDATA", str(runtime))
+    started = cli.service(service_args("start"))
+    assert started["running"] is True
+    assert cli.service(service_args("status"))["running"] is True
+    cli.service(service_args("stop"))
+
+
+def test_concurrent_start_lock_has_bounded_failure(tmp_path: Path, monkeypatch):
     runtime = tmp_path / "runtime"
     monkeypatch.setenv("LOCALAPPDATA", str(runtime))
     files = service_files(runtime)
@@ -94,6 +109,32 @@ def test_t4_start_lock_has_bounded_failure(tmp_path: Path, monkeypatch):
     with pytest.raises(HumanRequired, match="supervisor_start_lock"):
         cli.service(service_args("start"))
     assert files["lock"].exists()
+
+
+def test_t7_service_start_preserves_detached_hidden_policy(tmp_path: Path, monkeypatch):
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("LOCALAPPDATA", str(runtime))
+    monkeypatch.setattr(cli, "SERVICE_START_TIMEOUT_SECONDS", 0.01)
+    seen: dict[str, object] = {}
+
+    class ExitedChild:
+        pid = 56789
+
+        @staticmethod
+        def poll():
+            return 1
+
+    def fake_spawn(*args, **kwargs):
+        seen.update(kwargs)
+        return ExitedChild()
+
+    monkeypatch.setattr(cli, "spawn_background", fake_spawn)
+    with pytest.raises(HumanRequired, match="supervisor_readiness"):
+        cli.service(service_args("start"))
+    assert seen["detached"] is True
+    assert seen["close_fds"] is True
+    assert seen["stdout"] is subprocess.DEVNULL
+    assert seen["stderr"] is subprocess.DEVNULL
 
 
 def test_t5_status_false_and_cleans_artifacts_after_crash(tmp_path: Path, monkeypatch):
