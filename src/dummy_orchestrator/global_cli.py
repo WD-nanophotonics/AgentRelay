@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import hashlib
@@ -400,6 +401,7 @@ SERVICE_START_TIMEOUT_SECONDS = 12.0
 SERVICE_STOP_TIMEOUT_SECONDS = 8.0
 SERVICE_POLL_SECONDS = 0.1
 SERVICE_HEARTBEAT_MAX_AGE_SECONDS = 30.0
+SERVICE_HEARTBEAT_INTERVAL_SECONDS = 1.0
 SERVICE_OWNER = "agentrelay-supervisor"
 
 
@@ -511,6 +513,25 @@ def _service_status(paths: dict[str, Path]) -> dict[str, object]:
         result["detail"] = "live supervisor metadata is not ready or is not AgentRelay-owned"
         result["observed_pid"] = pid
     return result
+
+
+def _heartbeat_loop(paths: dict[str, Path], record: dict[str, object], stop_event: threading.Event) -> None:
+    """Publish liveness independently of synchronous orchestration work.
+
+    The writer is deliberately limited to service metadata.  It stops as soon
+    as the PID/generation record is replaced or a cooperative stop is owned by
+    this generation, so a stale supervisor cannot revive its heartbeat.
+    """
+    while not stop_event.is_set():
+        current = _read_pid_record(paths["pid"])
+        stop = _read_json(paths["stop"])
+        owns_process = _record_pid(record) == os.getpid() and _pid_alive(os.getpid())
+        if not _same_identity(current, record) or _same_identity(stop, record) or not owns_process:
+            return
+        heartbeat = record | {"heartbeat_epoch": time.time(), "heartbeat_at": datetime.now(UTC).isoformat()}
+        _atomic_json_write(paths["heartbeat"], heartbeat)
+        if stop_event.wait(SERVICE_HEARTBEAT_INTERVAL_SECONDS):
+            return
 
 
 def _acquire_service_lock(paths: dict[str, Path]) -> str:
@@ -694,6 +715,22 @@ def supervisor(_args: argparse.Namespace) -> int:
         _cleanup_owned_artifacts(paths, existing)
     _atomic_json_write(paths["pid"], record)
     _atomic_json_write(paths["ready"], record | {"ready_epoch": time.time(), "ready_at": datetime.now(UTC).isoformat()})
+    heartbeat_stop = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(paths, record, heartbeat_stop),
+        name="agentrelay-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    test_block_seconds = 0.0
+    raw_test_block = os.environ.get("AGENTRELAY_TEST_BLOCK_SUPERVISOR_SECONDS")
+    if raw_test_block:
+        try:
+            test_block_seconds = max(0.0, min(float(raw_test_block), 300.0))
+        except ValueError:
+            test_block_seconds = 0.0
+    test_block_applied = False
     try:
         while True:
             try:
@@ -703,9 +740,11 @@ def supervisor(_args: argparse.Namespace) -> int:
                 stop = _read_json(paths["stop"])
                 if _same_identity(stop, record):
                     return 0
-                heartbeat = record | {"heartbeat_epoch": time.time(), "heartbeat_at": datetime.now(UTC).isoformat()}
-                _atomic_json_write(paths["heartbeat"], heartbeat)
-                _diag("supervisor_heartbeat", pid=os.getpid())
+                # This opt-in hook exists only for isolated lifecycle tests so
+                # they can hold the orchestration call beyond freshness TTL.
+                if test_block_seconds and not test_block_applied:
+                    time.sleep(test_block_seconds)
+                    test_block_applied = True
                 supervise_once()
                 time.sleep(1)
             except KeyboardInterrupt:
@@ -717,6 +756,8 @@ def supervisor(_args: argparse.Namespace) -> int:
                 crash.write_text(f"{datetime.now(UTC).isoformat()} {type(exc).__name__}: {exc}\n", encoding="utf-8")
                 time.sleep(1)
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=max(1.0, SERVICE_HEARTBEAT_INTERVAL_SECONDS * 2.0))
         _cleanup_owned_artifacts(paths, record)
 
 
