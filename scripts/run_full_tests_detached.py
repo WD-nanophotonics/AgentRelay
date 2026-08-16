@@ -36,6 +36,11 @@ def run(session: Path, timeout_seconds: int) -> int:
     command = [str(python), "-m", "pytest", "-q"]
     child_env = dict(os.environ)
     child_env["PATH"] = str(python.parent) + os.pathsep + child_env.get("PATH", "")
+    # A few legacy tests intentionally invoke the literal ``python`` command
+    # from an unrelated cwd. Keep those helpers on this checkout even when
+    # Windows resolves that bare command to a system interpreter.
+    source_root = repo / "src"
+    child_env["PYTHONPATH"] = str(source_root) + os.pathsep + child_env.get("PYTHONPATH", "")
     started = time.monotonic()
     write_json(session / "manifest.json", {
         "timestamp": now(),
