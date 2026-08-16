@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -33,6 +34,8 @@ def run(session: Path, timeout_seconds: int) -> int:
     python = repo / ".venv" / "Scripts" / "python.exe"
     identity = source_identity()
     command = [str(python), "-m", "pytest", "-q"]
+    child_env = dict(os.environ)
+    child_env["PATH"] = str(python.parent) + os.pathsep + child_env.get("PATH", "")
     started = time.monotonic()
     write_json(session / "manifest.json", {
         "timestamp": now(),
@@ -54,7 +57,11 @@ def run(session: Path, timeout_seconds: int) -> int:
     error: str | None = None
     try:
         with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
-            child = spawn_background(command, cwd=str(repo), stdout=stdout, stderr=stderr, close_fds=True, detached=True)
+            # The runner is already an independent pythonw process. Keep the
+            # test child short-lived and hidden so its exit code/handle remain
+            # directly observable while no console can be created.
+            child = spawn_background(command, cwd=str(repo), stdout=stdout, stderr=stderr,
+                                     close_fds=True, detached=False, env=child_env)
             (session / "pytest.pid").write_text(str(child.pid), encoding="utf-8")
             deadline = time.monotonic() + timeout_seconds
             while child.poll() is None and time.monotonic() < deadline:
@@ -75,10 +82,17 @@ def run(session: Path, timeout_seconds: int) -> int:
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
     duration = time.monotonic() - started
+    stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else ""
+    stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
+    summary_match = re.search(r"(?m)^.*\b\d+\s+(?:passed|failed|error|errors)\b.*$", stdout_text + "\n" + stderr_text)
+    summary = summary_match.group(0).strip() if summary_match else None
     if timed_out:
         status = "TIMEOUT"
     elif error:
         status = "ERROR"
+    elif exit_code == 0 and summary is None:
+        status = "UNDETERMINED"
+        error = "pytest exited 0 without a final summary line"
     elif exit_code == 0:
         status = "PASS"
     else:
@@ -90,6 +104,7 @@ def run(session: Path, timeout_seconds: int) -> int:
         "finished_at": now(),
         "duration_seconds": round(duration, 3),
         "status": status,
+        "pytest_summary": summary,
         "error": error,
     })
     (session / "finished.marker").write_text(now(), encoding="utf-8")
