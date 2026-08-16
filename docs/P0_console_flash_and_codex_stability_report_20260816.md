@@ -1,5 +1,9 @@
 # P0：控制台闪烁与 Codex 稳定性现场报告
 
+> **HISTORICAL / PRE-CERTIFICATION EVIDENCE** — This report records the
+> pre-fix investigation. The later frozen silent-background certification and
+> current version contract are separate records; see [VERSIONING.md](VERSIONING.md).
+
 日期：2026-08-16（Asia/Tokyo）  
 当前状态：**已停止所有 AgentRelay 工作；未完成认证；不得宣称 `AGENTRELAY_SILENT_BACKGROUND_READY`。**
 

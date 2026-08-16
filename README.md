@@ -4,17 +4,27 @@ Standalone Gmail → persistent Codex worker → ChatGPT auditor loop with a dum
 
 The same package now exposes the reusable user-scoped `agent-relay` tool for production-oriented projects. The dummy mode remains the certified regression path; production mode verifies Git delivery but never commits or pushes for the worker.
 
+Current branch roles, source identity, explicit sandbox invocation, and the
+production-installation boundary are defined in
+[docs/VERSIONING.md](docs/VERSIONING.md). Do not use a bare `agent-relay`
+command for certification.
+
 ## Setup
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e .
 .\.venv\Scripts\orchestrator init
-# Make the contact tool available from normal Codex shells (user scope):
-python -m pip install --user -e .
+# Sandbox-only explicit invocation:
+.\.venv\Scripts\agent-relay.exe --version
 # install the official standalone CLI locally (never use the desktop MSIX binary)
 npm.cmd install --prefix .codex-cli --no-audit --no-fund @openai/codex@0.147.0
 ```
+
+The `.venv` editable install is for this sandbox checkout only. Do not use
+`pip install --user -e .` as a production installation. Production must later
+come from the exact certified `master` commit or stable tag in a separate
+non-editable environment.
 
 Edit `config/projects.yaml` only if a separate recipient is intended; otherwise leave `worker_email` empty and the adapter will use Gmail `users.getProfile` after OAuth. Place the existing Google OAuth desktop-client JSON at `%LOCALAPPDATA%\CodexOrchestrator\secrets\oauth-client.json` (never in this repository), then run:
 

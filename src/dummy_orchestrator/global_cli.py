@@ -9,6 +9,7 @@ import time
 import uuid
 import hashlib
 import ctypes
+from importlib import metadata
 from datetime import UTC, datetime
 from urllib.parse import urlparse
 from pathlib import Path
@@ -18,21 +19,55 @@ from .models import EventType, OrchestratorEvent, ProjectState
 from .registry import ProjectRegistrationStore, discover_registration, normalize_project_id
 from .state import StateStore
 from .process_policy import run_hidden, spawn_background
+from .version import __version__
 
 
-TOOL_VERSION = "0.3.7"
+TOOL_VERSION = __version__
+
+def _source_root(source: Path) -> Path | None:
+    for candidate in source.parents:
+        if (candidate / "pyproject.toml").is_file() and (candidate / "src").is_dir():
+            return candidate
+    return None
+
+
+def _git_identity(root: Path | None) -> dict[str, object]:
+    if root is None:
+        return {"git_revision": None, "git_branch": None, "git_dirty": None}
+    try:
+        revision = run_hidden(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5).stdout.strip()
+        branch = run_hidden(["git", "-C", str(root), "branch", "--show-current"], capture_output=True, text=True, timeout=5).stdout.strip()
+        status = run_hidden(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"], capture_output=True, text=True, timeout=5).stdout
+        return {"git_revision": revision or None, "git_branch": branch or None, "git_dirty": bool(status.strip())}
+    except Exception:
+        return {"git_revision": None, "git_branch": None, "git_dirty": None}
+
 
 def source_identity() -> dict:
     source = Path(__file__).resolve()
-    package_root = source.parents[2]
+    package_root = _source_root(source)
+    package_files = sorted((package_root / "src/dummy_orchestrator").glob("*.py")) if package_root else sorted(source.parent.glob("*.py"))
     digest = hashlib.sha256()
-    for path in sorted(package_root.glob("src/dummy_orchestrator/*.py")):
-        digest.update(str(path.relative_to(package_root)).encode()); digest.update(path.read_bytes())
-    revision = ""
+    for path in package_files:
+        relative = path.relative_to(package_root).as_posix() if package_root else path.name
+        digest.update(relative.encode()); digest.update(path.read_bytes())
     try:
-        revision = run_hidden(["git", "-C", str(package_root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5).stdout.strip()
-    except Exception: pass
-    return {"version": TOOL_VERSION, "install_source": str(package_root), "package_path": str(source), "source_fingerprint": digest.hexdigest()[:16], "git_revision": revision or None}
+        metadata_version = metadata.version("dummy-agent-orchestrator")
+    except metadata.PackageNotFoundError:
+        metadata_version = None
+    git = _git_identity(package_root)
+    source_package = package_root / "src/dummy_orchestrator" if package_root else None
+    return {
+        "version": __version__,
+        "version_source": str(source_package / "version.py") if source_package else str(source.parent / "version.py"),
+        "install_source": str(package_root) if package_root else None,
+        "package_path": str(source),
+        "install_mode": "editable/source" if package_root else "installed",
+        "installed_metadata_version": metadata_version,
+        "version_consistent": metadata_version in (None, __version__),
+        "source_fingerprint": digest.hexdigest()[:16],
+        **git,
+    }
 
 AGENT_GUIDE = """You are an AgentRelay-managed bounded worker.
 

@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .process_policy import run_hidden, spawn_background
+from .version import __version__
 
-VERSION = "0.3.7"
 
 
 def root() -> Path:
@@ -110,7 +110,7 @@ def create_session(tag: str) -> Path:
     manifest = {"started_at": now(), "tag": tag, "launcher_pid": os.getpid(),
                 "launcher_parent_pid": os.getppid(),
                 "python": sys.version, "platform": platform.platform(),
-                "agentrelay_version": VERSION, "diagnostics_session": str(session),
+                "agentrelay_version": __version__, "diagnostics_session": str(session),
                 "codex_logs": logs, "recorder_contract": "detached-observation-v1"}
     (session / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     (session / "codex-log-inventory.json").write_text(json.dumps(_log_inventory(logs), indent=2), encoding="utf-8")

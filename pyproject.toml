@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dummy-agent-orchestrator"
-version = "0.3.7"
+dynamic = ["version"]
 description = "Durable, multi-project dummy orchestration platform"
 requires-python = ">=3.12"
 dependencies = [
@@ -22,3 +22,6 @@ codex-orchestrator = "dummy_orchestrator.global_cli:main"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.setuptools.dynamic]
+version = {attr = "dummy_orchestrator.version.__version__"}

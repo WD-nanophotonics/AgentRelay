@@ -1,5 +1,9 @@
 # Production-readiness certification
 
+> **HISTORICAL** — This report describes the earlier 0.3.0 certification
+> state. It is retained as evidence and is not the current AgentRelay runtime
+> or version-management contract. See [VERSIONING.md](VERSIONING.md).
+
 Date: 2026-08-14
 
 ## Result
