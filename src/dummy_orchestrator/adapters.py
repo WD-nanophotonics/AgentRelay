@@ -25,6 +25,25 @@ class HumanRequired(RuntimeError):
     pass
 
 
+def _process_is_alive(pid: int) -> bool:
+    """Check a Windows process without sending it a signal."""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x00100000 | 0x1000, False, pid)
+    if not handle:
+        return False
+    try:
+        exit_code = ctypes.c_ulong()
+        return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) and exit_code.value == 259)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 AGENTRELAY_EXECUTION_CONTRACT = """AGENTRELAY EXECUTION CONTRACT
 - Work only on the supplied TASK or CORRECTIVE instruction.
 - Do not advance to another phase autonomously.
@@ -310,7 +329,8 @@ class ChatGPTWebAuditorAdapter:
         except FileExistsError as exc:
             try:
                 owner = int(lock.read_text(encoding="utf-8"))
-                os.kill(owner, 0)
+                if not _process_is_alive(owner):
+                    raise OSError(owner)
             except (OSError, ValueError):
                 lock.unlink(missing_ok=True)
                 fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)

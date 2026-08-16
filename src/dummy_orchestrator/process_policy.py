@@ -25,21 +25,22 @@ def _hidden_startupinfo() -> Any | None:
 
 def _short_lived_kwargs() -> dict[str, Any]:
     if os.name != "nt":
-        return {}
+        return {"stdin": subprocess.DEVNULL}
     return {
         "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
         "startupinfo": _hidden_startupinfo(),
+        "stdin": subprocess.DEVNULL,
     }
 
 
 def _detached_kwargs() -> dict[str, Any]:
     if os.name != "nt":
-        return {}
+        return {"stdin": subprocess.DEVNULL}
     # DETACHED_PROCESS is the correct lifetime model for a service/recorder;
     # CREATE_NO_WINDOW is intentionally not combined with it because Windows
     # documents that CREATE_NO_WINDOW is ignored for detached processes.
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    return {"creationflags": flags, "startupinfo": _hidden_startupinfo()}
+    return {"creationflags": flags, "startupinfo": _hidden_startupinfo(), "stdin": subprocess.DEVNULL}
 
 
 def run_hidden(command: Sequence[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[Any]:
