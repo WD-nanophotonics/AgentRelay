@@ -24,7 +24,7 @@ def test_global_invocation_and_adopt_identify_from_unrelated_repo(tmp_path: Path
     (root / "README.md").write_text("scratch", encoding="utf-8"); git(root, "add", "."); git(root, "commit", "-m", "init"); git(root, "branch", "-M", "worker")
     runtime = tmp_path / "runtime"; env = dict(os.environ, LOCALAPPDATA=str(runtime))
     command = ["python", "-m", "dummy_orchestrator.global_cli"]
-    adopted = subprocess.run(command + ["adopt", "--project-id", "scratch_project", "--auditor-url", "https://chatgpt.com/c/scratch", "--worker-branch", "worker"], cwd=root, env=env, capture_output=True, text=True, check=True)
+    adopted = subprocess.run(command + ["adopt", "--project-id", "scratch_project", "--auditor-url", "https://chatgpt.com/c/scratch", "--worker-branch", "worker", "--mode", "dummy"], cwd=root, env=env, capture_output=True, text=True, check=True)
     assert "scratch_project" in adopted.stdout and "handoff_package" in adopted.stdout
     identified = subprocess.run(command + ["identify"], cwd=root, env=env, capture_output=True, text=True, check=True)
     assert json.loads(identified.stdout)["managed"] is True
