@@ -14,6 +14,7 @@ command for certification.
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -e .
+.\.venv\Scripts\python -m pip install -e ".[test]"
 .\.venv\Scripts\orchestrator init
 # Sandbox-only explicit invocation:
 .\.venv\Scripts\agent-relay.exe --version

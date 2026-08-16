@@ -57,7 +57,7 @@ The sandbox environment is intentionally explicit and may be editable:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --no-deps -e .
+.\.venv\Scripts\python.exe -m pip install -e ".[test]"
 .\.venv\Scripts\agent-relay.exe --version
 ```
 
