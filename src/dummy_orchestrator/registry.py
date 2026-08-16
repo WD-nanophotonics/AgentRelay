@@ -129,6 +129,28 @@ class ProjectRegistrationStore:
             Path(temp_name).unlink(missing_ok=True)
         return registration
 
+    def _write(self, data: dict[str, dict]) -> None:
+        """Atomically replace the registry JSON with already-validated data."""
+        fd, temp_name = tempfile.mkstemp(prefix="projects-", suffix=".json", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+            os.replace(temp_name, self.path)
+        finally:
+            Path(temp_name).unlink(missing_ok=True)
+
+    def configure_auditor_url(self, project_id: str, auditor_url: str) -> ProjectRegistration:
+        """Explicitly update only the auditor URL of an existing registration."""
+        registration = self.get(project_id)
+        if registration.auditor_chat_url == auditor_url:
+            return registration
+        data = self._read()
+        raw = dict(data[registration.project_id])
+        raw["auditor_chat_url"] = auditor_url
+        data[registration.project_id] = raw
+        self._write(data)
+        return ProjectRegistration(**dict(raw, protected_branches=tuple(raw.get("protected_branches", ("main", "master", "develop")))))
+
     def configure_worker_email(self, project_id: str, worker_email: str) -> ProjectRegistration:
         registration = self.get(project_id)
         if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", worker_email.strip()):

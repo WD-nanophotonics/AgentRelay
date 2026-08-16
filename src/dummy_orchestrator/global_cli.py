@@ -209,8 +209,23 @@ def send_event(args) -> dict:
     return {"operator_recovery": True, "message_id": message_id, "subject": subject(project.gmail_subject_prefix, event), "event": {"ORCHESTRATOR_EVENT": {"schema_version": 1, "project_id": args.project_id, "run_id": args.run_id, "round_id": args.round_id, "event_type": str(event_type), "payload": payload}}}
 
 def configure_project(args) -> dict:
-    updated = _store().configure_worker_email(args.project_id, args.worker_email)
-    return {"project_id": updated.project_id, "worker_email": updated.worker_email, "gmail_worker_routing": "READY"}
+    store = _store()
+    current = store.get(args.project_id)
+    auditor_url = getattr(args, "auditor_url", None)
+    worker_email = getattr(args, "worker_email", None)
+    if auditor_url is not None and worker_email is not None:
+        raise HumanRequired("HUMAN_REQUIRED\nmissing_field = configuration_change\ndetail = configure one of auditor_url or worker_email at a time")
+    if auditor_url is not None:
+        validated_url = _validate_auditor_url(auditor_url)
+        updated = store.configure_auditor_url(current.project_id, validated_url)
+        changed = updated.auditor_chat_url != current.auditor_chat_url
+        return {"project_id": updated.project_id, "old_auditor_url": current.auditor_chat_url,
+                "new_auditor_url": updated.auditor_chat_url, "repository_root": updated.repository_root,
+                "worker_branch": updated.worker_branch, "changed": changed, "unchanged": not changed}
+    if worker_email is not None:
+        updated = store.configure_worker_email(current.project_id, worker_email)
+        return {"project_id": updated.project_id, "worker_email": updated.worker_email, "gmail_worker_routing": "READY"}
+    raise HumanRequired("HUMAN_REQUIRED\nmissing_field = configuration_change\ndetail = pass --auditor-url or --worker-email")
 
 def resend_audit(args) -> dict:
     registration = _store().get(args.project_id); record = _state().project(args.project_id)
@@ -475,7 +490,7 @@ def parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
     q = sub.add_parser("register"); q.add_argument("--project-id", required=True); q.add_argument("--auditor-url", required=True); q.add_argument("--worker-branch"); q.add_argument("--worker-email"); q.add_argument("--protected-branch", action="append", default=["main", "master", "develop"]); q.add_argument("--mode", choices=["production", "dummy"], default="production")
     q = sub.add_parser("adopt"); q.add_argument("--project-id", required=True); q.add_argument("--auditor-url", required=True); q.add_argument("--worker-branch"); q.add_argument("--worker-email"); q.add_argument("--protected-branch", action="append", default=["main", "master", "develop"]); q.add_argument("--mode", choices=["production", "dummy"], default="production"); q.add_argument("--bootstrap", action="store_true")
-    q = sub.add_parser("project"); project_sub = q.add_subparsers(dest="project_action", required=True); q = project_sub.add_parser("configure"); q.add_argument("--project-id", required=True); q.add_argument("--worker-email", required=True)
+    q = sub.add_parser("project"); project_sub = q.add_subparsers(dest="project_action", required=True); q = project_sub.add_parser("configure"); q.add_argument("--project-id", required=True); q.add_argument("--worker-email"); q.add_argument("--auditor-url")
     q = sub.add_parser("audit"); audit_sub = q.add_subparsers(dest="audit_action", required=True); q = audit_sub.add_parser("resend"); q.add_argument("--project-id", required=True); q.add_argument("--run-id", required=True); q.add_argument("--round-id", required=True); q.add_argument("--delivery-sha", required=True)
     q = sub.add_parser("agent-guide"); q.add_argument("--format", choices=["text", "json"], default="text")
     sub.add_parser("identify").add_argument("--project-id", default=None)
