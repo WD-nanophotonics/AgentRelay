@@ -11,6 +11,7 @@ import hashlib
 import ctypes
 from importlib import metadata
 from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import urlparse
 from pathlib import Path
 
@@ -395,37 +396,243 @@ def resume_project(args) -> dict:
     return {"woken_events": events}
 
 
+SERVICE_START_TIMEOUT_SECONDS = 12.0
+SERVICE_STOP_TIMEOUT_SECONDS = 8.0
+SERVICE_POLL_SECONDS = 0.1
+SERVICE_HEARTBEAT_MAX_AGE_SECONDS = 30.0
+SERVICE_OWNER = "agentrelay-supervisor"
+
+
+def _service_paths() -> dict[str, Path]:
+    path = data_root() / "service"
+    return {
+        "root": path,
+        "pid": path / "supervisor.pid",
+        "ready": path / "supervisor.ready.json",
+        "heartbeat": path / "supervisor.heartbeat.json",
+        "stop": path / "supervisor.stop.json",
+        "lock": path / "supervisor.start.lock",
+    }
+
+
+def _atomic_json_write(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _read_json(path: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None
+
+
+def _read_pid_record(path: Path) -> dict[str, object] | None:
+    """Read current metadata, accepting the pre-0.3.8 integer format safely."""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        try:
+            value = int(raw)
+        except ValueError:
+            return {"invalid": True}
+    if isinstance(value, int):
+        return {"pid": value, "legacy": True}
+    if isinstance(value, dict):
+        return value
+    return {"invalid": True}
+
+
+def _record_pid(record: dict[str, object] | None) -> int | None:
+    if not record or record.get("invalid"):
+        return None
+    try:
+        return int(record["pid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _owned_record(record: dict[str, object] | None) -> bool:
+    return bool(record and record.get("owner") == SERVICE_OWNER and record.get("generation"))
+
+
+def _same_identity(record: dict[str, object] | None, other: dict[str, object] | None) -> bool:
+    return bool(record and other and record.get("pid") == other.get("pid")
+                and record.get("generation") == other.get("generation"))
+
+
+def _cleanup_owned_artifacts(paths: dict[str, Path], record: dict[str, object] | None) -> None:
+    """Remove only artifacts proven to belong to this AgentRelay generation."""
+    if not _owned_record(record):
+        return
+    current = _read_pid_record(paths["pid"])
+    if _same_identity(current, record):
+        paths["pid"].unlink(missing_ok=True)
+    for key in ("ready", "heartbeat", "stop"):
+        value = _read_json(paths[key])
+        if _same_identity(value, record):
+            paths[key].unlink(missing_ok=True)
+
+
+def _service_status(paths: dict[str, Path]) -> dict[str, object]:
+    record = _read_pid_record(paths["pid"])
+    pid = _record_pid(record)
+    alive = bool(pid and _pid_alive(pid))
+    ready = _read_json(paths["ready"])
+    heartbeat = _read_json(paths["heartbeat"])
+    identity_ready = _same_identity(record, ready)
+    identity_heartbeat = _same_identity(record, heartbeat)
+    heartbeat_age = None
+    if identity_heartbeat:
+        try:
+            heartbeat_age = max(0.0, time.time() - float(heartbeat["heartbeat_epoch"]))
+        except (KeyError, TypeError, ValueError):
+            heartbeat_age = None
+    certified = bool(alive and _owned_record(record) and identity_ready and identity_heartbeat
+                     and heartbeat_age is not None and heartbeat_age <= SERVICE_HEARTBEAT_MAX_AGE_SECONDS)
+    if record and not alive and (_owned_record(record) or record.get("legacy")):
+        _cleanup_owned_artifacts(paths, record)
+        if record.get("legacy"):
+            paths["pid"].unlink(missing_ok=True)
+        record = None
+        pid = None
+    result: dict[str, object] = {"running": certified, "pid": pid if certified else None}
+    if certified:
+        result.update({"generation": record["generation"], "heartbeat_age_seconds": round(heartbeat_age or 0.0, 3)})
+    elif record and pid and alive:
+        # A live but uncertified PID is never overwritten or killed blindly.
+        result["detail"] = "live supervisor metadata is not ready or is not AgentRelay-owned"
+        result["observed_pid"] = pid
+    return result
+
+
+def _acquire_service_lock(paths: dict[str, Path]) -> str:
+    token = json.dumps({"pid": os.getpid(), "created_epoch": time.time()})
+    deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
+    while True:
+        try:
+            fd = os.open(str(paths["lock"]), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(token)
+            return token
+        except FileExistsError:
+            lock = _read_json(paths["lock"])
+            owner_pid = _record_pid(lock)
+            if not owner_pid or not _pid_alive(owner_pid):
+                paths["lock"].unlink(missing_ok=True)
+                continue
+            current = _service_status(paths)
+            if current["running"]:
+                return "already-running"
+            if time.monotonic() >= deadline:
+                raise HumanRequired("HUMAN_REQUIRED\nmissing_field = supervisor_start_lock\ndetail = another AgentRelay supervisor start did not become ready")
+            time.sleep(SERVICE_POLL_SECONDS)
+
+
+def _release_service_lock(paths: dict[str, Path], token: str) -> None:
+    if token == "already-running":
+        return
+    try:
+        if paths["lock"].read_text(encoding="utf-8") == token:
+            paths["lock"].unlink(missing_ok=True)
+    except (FileNotFoundError, OSError):
+        return
+
+
+def _wait_for_service_ready(paths: dict[str, Path], expected_pid: int, generation: str,
+                            child: subprocess.Popen[Any] | None = None) -> dict[str, object]:
+    deadline = time.monotonic() + SERVICE_START_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        current = _service_status(paths)
+        if current.get("running") and current.get("generation") == generation:
+            # On some Windows Python installations the detached launcher PID
+            # differs from the final interpreter PID.  The generation-specific
+            # publication is the authoritative child identity; retain the
+            # launcher PID only as diagnostic evidence.
+            return current | {"launch_pid": expected_pid}
+        if child is not None and child.poll() is not None:
+            break
+        time.sleep(SERVICE_POLL_SECONDS)
+    current = _service_status(paths)
+    raise HumanRequired(
+        "HUMAN_REQUIRED\nmissing_field = supervisor_readiness\n"
+        f"detail = supervisor PID {expected_pid} did not publish matching ready/heartbeat evidence "
+        f"within {SERVICE_START_TIMEOUT_SECONDS:.0f}s; observed={json.dumps(current, sort_keys=True)}"
+    )
+
+
 def service(args: argparse.Namespace) -> dict:
     _diag("service_command", action=args.action)
-    path = data_root() / "service"; path.mkdir(parents=True, exist_ok=True); pid_path = path / "supervisor.pid"
+    paths = _service_paths()
+    paths["root"].mkdir(parents=True, exist_ok=True)
     if args.action == "status":
-        pid = int(pid_path.read_text()) if pid_path.exists() else None
-        alive = _pid_alive(pid) if pid else False
-        if pid and not alive: pid_path.unlink(missing_ok=True); pid = None
-        _diag("service_status", running=alive, pid=pid)
-        return {"running": alive, "pid": pid}
+        result = _service_status(paths)
+        _diag("service_status", **result)
+        return result
     if args.action == "ensure":
         current = service(argparse.Namespace(action="status"))
         if current["running"]: return current | {"ensured": True}
         started = service(argparse.Namespace(action="start"))
-        if not started.get("running"): raise HumanRequired("HUMAN_REQUIRED\nmissing_field = supervisor_service\ndetail = failed to start supervisor")
+        if not started.get("running"):
+            raise HumanRequired("HUMAN_REQUIRED\nmissing_field = supervisor_service\ndetail = failed to start supervisor")
         return started | {"ensured": True}
     if args.action == "stop":
-        if pid_path.exists():
-            pid = int(pid_path.read_text())
-            try: os.kill(pid, 15)
-            except OSError: pass
-            pid_path.unlink(missing_ok=True)
-            _diag("service_stop_requested", pid=pid)
-        return {"running": False}
+        record = _read_pid_record(paths["pid"])
+        pid = _record_pid(record)
+        if not pid or not _owned_record(record):
+            if pid and _pid_alive(pid):
+                raise HumanRequired("HUMAN_REQUIRED\nmissing_field = supervisor_ownership\ndetail = refusing to stop a live non-AgentRelay PID")
+            if record and record.get("legacy"):
+                paths["pid"].unlink(missing_ok=True)
+            return {"running": False, "pid": None, "stop_requested": False}
+        stop = {"owner": SERVICE_OWNER, "pid": pid, "generation": record["generation"], "requested_epoch": time.time()}
+        _atomic_json_write(paths["stop"], stop)
+        _diag("service_stop_requested", pid=pid, generation=record["generation"])
+        deadline = time.monotonic() + SERVICE_STOP_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if not _service_status(paths)["running"]:
+                return {"running": False, "pid": None, "stop_requested": True}
+            time.sleep(SERVICE_POLL_SECONDS)
+        raise HumanRequired("HUMAN_REQUIRED\nmissing_field = supervisor_stop\ndetail = supervisor did not acknowledge the stop request")
     if args.action == "start":
-        current = service(argparse.Namespace(action="status"))
-        if current["running"]: return current
-        command = [sys.executable, "-m", "dummy_orchestrator.global_cli", "_supervisor"]
-        proc = spawn_background(command, detached=True, close_fds=True, cwd=str(data_root()), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        pid_path.write_text(str(proc.pid), encoding="utf-8")
-        _diag("supervisor_spawned", pid=proc.pid, argv=command, creation_flags="detached_hidden_policy", cwd=str(data_root()))
-        return {"running": True, "pid": proc.pid, "scope": "user"}
+        token = _acquire_service_lock(paths)
+        try:
+            current = service(argparse.Namespace(action="status"))
+            if current["running"]: return current
+            existing = _read_pid_record(paths["pid"])
+            existing_pid = _record_pid(existing)
+            if existing_pid and _pid_alive(existing_pid):
+                if _owned_record(existing):
+                    return _wait_for_service_ready(paths, existing_pid, str(existing["generation"]))
+                raise HumanRequired("HUMAN_REQUIRED\nmissing_field = supervisor_ownership\ndetail = refusing to overwrite a live non-AgentRelay PID record")
+            if existing and existing.get("invalid"):
+                raise HumanRequired("HUMAN_REQUIRED\nmissing_field = supervisor_metadata\ndetail = refusing to overwrite malformed supervisor metadata")
+            if existing and _owned_record(existing):
+                _cleanup_owned_artifacts(paths, existing)
+            generation = uuid.uuid4().hex
+            child_env = dict(os.environ)
+            child_env.update({
+                "AGENTRELAY_SUPERVISOR_GENERATION": generation,
+                "AGENTRELAY_SUPERVISOR_PID_PATH": str(paths["pid"]),
+                "AGENTRELAY_SUPERVISOR_READY_PATH": str(paths["ready"]),
+                "AGENTRELAY_SUPERVISOR_HEARTBEAT_PATH": str(paths["heartbeat"]),
+                "AGENTRELAY_SUPERVISOR_STOP_PATH": str(paths["stop"]),
+            })
+            command = [sys.executable, "-m", "dummy_orchestrator.global_cli", "_supervisor"]
+            proc = spawn_background(command, detached=True, close_fds=True, cwd=str(data_root()),
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env)
+            _diag("supervisor_spawned", pid=proc.pid, generation=generation, argv=command,
+                  creation_flags="detached_hidden_policy", cwd=str(data_root()))
+            return _wait_for_service_ready(paths, proc.pid, generation, proc)
+        finally:
+            _release_service_lock(paths, token)
     raise ValueError(args.action)
 
 
@@ -447,7 +654,7 @@ def _pid_alive(pid: int) -> bool:
             return False
         except Exception: return False
     try: os.kill(pid, 0); return True
-    except OSError: return False
+    except (OSError, ProcessLookupError, PermissionError): return False
 
 def monitor(_args) -> int:
     from .monitor import Monitor
@@ -464,24 +671,53 @@ def diagnostics_command(args):
 
 
 def supervisor(_args: argparse.Namespace) -> int:
-    pid_path = data_root() / "service" / "supervisor.pid"
-    deadline = time.monotonic() + 30
-    while True:
-        try:
-            if not pid_path.exists():
-                if time.monotonic() >= deadline: return 0
-                time.sleep(1); continue
-            if int(pid_path.read_text()) != os.getpid(): return 0
-            _diag("supervisor_heartbeat", pid=os.getpid())
-            supervise_once()
-            time.sleep(10)
-        except KeyboardInterrupt: return 0
-        except Exception as exc:
-            _diag("supervisor_exception", traceback=__import__("traceback").format_exc())
-            crash = data_root() / "service" / "supervisor-crash.log"
-            crash.parent.mkdir(parents=True, exist_ok=True)
-            crash.write_text(f"{datetime.now(UTC).isoformat()} {type(exc).__name__}: {exc}\n", encoding="utf-8")
-            time.sleep(2)
+    paths = _service_paths()
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    generation = os.environ.get("AGENTRELAY_SUPERVISOR_GENERATION") or uuid.uuid4().hex
+    env_paths = {
+        "pid": os.environ.get("AGENTRELAY_SUPERVISOR_PID_PATH"),
+        "ready": os.environ.get("AGENTRELAY_SUPERVISOR_READY_PATH"),
+        "heartbeat": os.environ.get("AGENTRELAY_SUPERVISOR_HEARTBEAT_PATH"),
+        "stop": os.environ.get("AGENTRELAY_SUPERVISOR_STOP_PATH"),
+    }
+    for key, value in env_paths.items():
+        if value:
+            paths[key] = Path(value)
+    record = {"schema": 1, "owner": SERVICE_OWNER, "pid": os.getpid(), "generation": generation,
+              "started_epoch": time.time(), "started_at": datetime.now(UTC).isoformat()}
+    existing = _read_pid_record(paths["pid"])
+    existing_pid = _record_pid(existing)
+    if existing_pid and existing_pid != os.getpid() and _pid_alive(existing_pid):
+        _diag("supervisor_refused_foreign_pid", pid=existing_pid, generation=generation)
+        return 1
+    if existing and _owned_record(existing):
+        _cleanup_owned_artifacts(paths, existing)
+    _atomic_json_write(paths["pid"], record)
+    _atomic_json_write(paths["ready"], record | {"ready_epoch": time.time(), "ready_at": datetime.now(UTC).isoformat()})
+    try:
+        while True:
+            try:
+                current = _read_pid_record(paths["pid"])
+                if not _same_identity(current, record):
+                    return 0
+                stop = _read_json(paths["stop"])
+                if _same_identity(stop, record):
+                    return 0
+                heartbeat = record | {"heartbeat_epoch": time.time(), "heartbeat_at": datetime.now(UTC).isoformat()}
+                _atomic_json_write(paths["heartbeat"], heartbeat)
+                _diag("supervisor_heartbeat", pid=os.getpid())
+                supervise_once()
+                time.sleep(1)
+            except KeyboardInterrupt:
+                return 0
+            except Exception as exc:
+                _diag("supervisor_exception", traceback=__import__("traceback").format_exc())
+                crash = data_root() / "service" / "supervisor-crash.log"
+                crash.parent.mkdir(parents=True, exist_ok=True)
+                crash.write_text(f"{datetime.now(UTC).isoformat()} {type(exc).__name__}: {exc}\n", encoding="utf-8")
+                time.sleep(1)
+    finally:
+        _cleanup_owned_artifacts(paths, record)
 
 
 def parser() -> argparse.ArgumentParser:
