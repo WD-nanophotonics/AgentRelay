@@ -39,14 +39,15 @@ class StateStore:
               chrome_path TEXT, chrome_version TEXT, chrome_selection_reason TEXT, cdp_endpoint TEXT,
               repository_root TEXT, git_remote TEXT, worker_branch TEXT, protected_branches TEXT,
               persistent_codex_session TEXT, current_thread_id TEXT,
-              active_event_round_id TEXT, active_event_type TEXT, active_event_gmail_id TEXT
+              active_event_round_id TEXT, active_event_type TEXT, active_event_gmail_id TEXT,
+              active_event_payload_json TEXT
             );
             CREATE TABLE IF NOT EXISTS processed_messages (
               gmail_message_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, processed_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS deliveries (
               delivery_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, run_id TEXT NOT NULL,
-              round_id TEXT NOT NULL, audited_at TEXT
+              round_id TEXT NOT NULL, audited_at TEXT, provenance_json TEXT
             );
             CREATE TABLE IF NOT EXISTS audit_requests (
               delivery_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, run_id TEXT NOT NULL,
@@ -71,8 +72,11 @@ class StateStore:
             );
             """)
             columns = {row["name"] for row in con.execute("PRAGMA table_info(projects)")}
-            for name in ("codex_path", "codex_version", "codex_selection_reason", "chrome_path", "chrome_version", "chrome_selection_reason", "cdp_endpoint", "repository_root", "git_remote", "worker_branch", "protected_branches", "persistent_codex_session", "current_thread_id", "active_event_round_id", "active_event_type", "active_event_gmail_id"):
+            for name in ("codex_path", "codex_version", "codex_selection_reason", "chrome_path", "chrome_version", "chrome_selection_reason", "cdp_endpoint", "repository_root", "git_remote", "worker_branch", "protected_branches", "persistent_codex_session", "current_thread_id", "active_event_round_id", "active_event_type", "active_event_gmail_id", "active_event_payload_json"):
                 if name not in columns: con.execute(f"ALTER TABLE projects ADD COLUMN {name} TEXT")
+            delivery_columns = {row["name"] for row in con.execute("PRAGMA table_info(deliveries)")}
+            if "provenance_json" not in delivery_columns:
+                con.execute("ALTER TABLE deliveries ADD COLUMN provenance_json TEXT")
 
     def ensure_project(self, project_id: str) -> None:
         with self.connect() as con:
@@ -86,7 +90,7 @@ class StateStore:
     def transition(self, project_id: str, state: ProjectState, detail: dict | None = None, **updates: str | None) -> None:
         current = self.project(project_id)
         at = now()
-        allowed = {"run_id", "round_id", "worker_session_id", "last_gmail_id", "error", "codex_path", "codex_version", "codex_selection_reason", "chrome_path", "chrome_version", "chrome_selection_reason", "cdp_endpoint", "repository_root", "git_remote", "worker_branch", "protected_branches", "persistent_codex_session", "current_thread_id", "active_event_round_id", "active_event_type", "active_event_gmail_id"}
+        allowed = {"run_id", "round_id", "worker_session_id", "last_gmail_id", "error", "codex_path", "codex_version", "codex_selection_reason", "chrome_path", "chrome_version", "chrome_selection_reason", "cdp_endpoint", "repository_root", "git_remote", "worker_branch", "protected_branches", "persistent_codex_session", "current_thread_id", "active_event_round_id", "active_event_type", "active_event_gmail_id", "active_event_payload_json"}
         if unknown := set(updates) - allowed:
             raise ValueError(f"Unsupported project fields: {unknown}")
         fields = {"state": state, "last_transition_at": at, **updates}
@@ -114,13 +118,24 @@ class StateStore:
         with self.connect() as con:
             return con.execute("SELECT 1 FROM processed_messages WHERE gmail_message_id=? AND project_id=?", (gmail_message_id, project_id)).fetchone() is not None
 
-    def mark_delivery_once(self, delivery_id: str, project_id: str, run_id: str, round_id: str) -> bool:
+    def mark_delivery_once(self, delivery_id: str, project_id: str, run_id: str, round_id: str, provenance: dict | None = None) -> bool:
         with self.connect() as con:
             cursor = con.execute(
-                "INSERT OR IGNORE INTO deliveries(delivery_id, project_id, run_id, round_id) VALUES (?, ?, ?, ?)",
-                (delivery_id, project_id, run_id, round_id),
+                "INSERT OR IGNORE INTO deliveries(delivery_id, project_id, run_id, round_id, provenance_json) VALUES (?, ?, ?, ?, ?)",
+                (delivery_id, project_id, run_id, round_id, json.dumps(provenance, sort_keys=True) if provenance is not None else None),
             )
             return cursor.rowcount == 1
+
+    def delivery_provenance(self, delivery_id: str) -> dict | None:
+        with self.connect() as con:
+            row = con.execute("SELECT provenance_json FROM deliveries WHERE delivery_id=?", (delivery_id,)).fetchone()
+        if not row or not row["provenance_json"]:
+            return None
+        try:
+            value = json.loads(row["provenance_json"])
+            return value if isinstance(value, dict) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
 
     def latest_delivery(self, project_id: str, run_id: str, round_id: str) -> dict | None:
         with self.connect() as con:

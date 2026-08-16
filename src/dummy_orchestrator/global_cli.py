@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 from pathlib import Path
 
 from .adapters import ChatGPTWebAuditorAdapter, CodexWorkerAdapter, GmailInstructionBus, GitDeliveryAdapter, HumanRequired, subject
+from .audit_provenance import build_audit_request, build_audit_replay_request
 from .models import EventType, OrchestratorEvent, ProjectState
 from .registry import ProjectRegistrationStore, discover_registration, normalize_project_id
 from .state import StateStore
@@ -68,6 +69,7 @@ def source_identity() -> dict:
         "installed_metadata_version": metadata_version,
         "version_consistent": metadata_version in (None, __version__),
         "source_fingerprint": digest.hexdigest()[:16],
+        "python_executable": sys.executable,
         **git,
     }
 
@@ -240,9 +242,31 @@ def resend_audit(args) -> dict:
     if not _state().mark_audit_replay_once(args.delivery_sha, args.project_id, args.run_id, args.round_id):
         raise HumanRequired("HUMAN_REQUIRED\nmissing_field = duplicate_audit_replay\ndetail = audit replay already submitted for this delivery SHA")
     source = matches[0]; event = OrchestratorEvent(args.project_id, args.run_id, args.round_id, EventType.DELIVERY, source.payload, source.gmail_message_id)
+    original_provenance = _state().delivery_provenance(source.gmail_message_id or "")
+    if original_provenance:
+        audit_request = build_audit_replay_request(
+            original_provenance=original_provenance,
+            delivery_payload=source.payload,
+            delivery_message_id=source.gmail_message_id or args.delivery_sha,
+            agentrelay_audit_transport_identity=source_identity(),
+        )
+    else:
+        audit_request = build_audit_request(
+            project_id=args.project_id,
+            run_id=args.run_id,
+            round_id=args.round_id,
+            active_event_type=record.get("active_event_type") or "UNKNOWN",
+            active_event_gmail_id=record.get("active_event_gmail_id"),
+            active_event_payload=_active_event_payload(record),
+            delivery_message_id=source.gmail_message_id or args.delivery_sha,
+            delivery_payload=source.payload,
+            agentrelay_delivery_identity=None,
+            agentrelay_audit_transport_identity=source_identity(),
+            legacy_provenance=True,
+        )
     auditor = ChatGPTWebAuditorAdapter(Path(os.environ.get("LOCALAPPDATA", ".")) / "CodexOrchestrator" / "profiles" / "chatgpt", 60)
     try:
-        auditor.send_audit_request(project, event, source.gmail_message_id or args.delivery_sha)
+        auditor.send_audit_request(project, event, source.gmail_message_id or args.delivery_sha, audit_request=audit_request)
     except Exception:
         # A failed transport must remain retryable; remove the reservation.
         with _state().connect() as con: con.execute("DELETE FROM audit_replays WHERE delivery_sha=?", (args.delivery_sha,))
@@ -261,6 +285,17 @@ def _resolve(args: argparse.Namespace):
     return _store().resolve(args.project_id, Path.cwd())
 
 
+def _active_event_payload(record: dict) -> dict:
+    raw = record.get("active_event_payload_json")
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def deliver(args: argparse.Namespace) -> dict:
     registration = _resolve(args)
     if registration.mode != "production":
@@ -273,19 +308,37 @@ def deliver(args: argparse.Namespace) -> dict:
     phase_id = args.phase_id or args.round_id or record.get("active_event_round_id") or record.get("round_id")
     if not phase_id:
         raise HumanRequired("HUMAN_REQUIRED\nmissing_field = active_event_round_id\ndetail = delivery requires a persisted active event identity")
-    delivery_id, event = GitDeliveryAdapter(bus).deliver(project, run_id, phase_id, args.baseline_sha, args.task_id, phase_id)
+    if record.get("active_event_round_id") != phase_id:
+        raise HumanRequired("HUMAN_REQUIRED\nmissing_field = active_event_round_id\ndetail = delivery phase does not match the persisted active instruction")
+    if record.get("active_event_type") not in (str(EventType.TASK), str(EventType.CORRECTIVE)):
+        raise HumanRequired("HUMAN_REQUIRED\nmissing_field = active_event_type\ndetail = delivery requires a persisted TASK or CORRECTIVE instruction")
+    active_payload = _active_event_payload(record)
+    delivery_identity = source_identity()
+    delivery_id, event = GitDeliveryAdapter(bus).deliver(project, run_id, phase_id, args.baseline_sha, args.task_id, phase_id, delivery_identity)
     note = args.note
     if args.note_file:
         note = Path(args.note_file).read_text(encoding="utf-8")
     event = OrchestratorEvent(event.project_id, event.run_id, event.round_id, event.event_type, event.payload | {"gmail_event_type": "DELIVERED", "worker_note": note} if note else event.payload | {"gmail_event_type": "DELIVERED"}, delivery_id)
-    if delivery_id and not state.mark_delivery_once(delivery_id, project.project_id, run_id, phase_id):
+    audit_request = build_audit_request(
+        project_id=project.project_id,
+        run_id=run_id,
+        round_id=phase_id,
+        active_event_type=record["active_event_type"],
+        active_event_gmail_id=record.get("active_event_gmail_id"),
+        active_event_payload=active_payload,
+        delivery_message_id=delivery_id or "local-verified",
+        delivery_payload=event.payload,
+        agentrelay_delivery_identity=event.payload.get("agentrelay_delivery_identity", delivery_identity),
+        agentrelay_audit_transport_identity=delivery_identity,
+    )
+    if delivery_id and not state.mark_delivery_once(delivery_id, project.project_id, run_id, phase_id, provenance=audit_request["AUDIT_PROVENANCE"]):
         return {"duplicate": True, "delivery_message_id": delivery_id}
     state.transition(project.project_id, ProjectState.AUDIT_PENDING, {"production_delivery_verified": True}, run_id=run_id, round_id=phase_id, last_gmail_id=delivery_id, repository_root=project.repository_root, git_remote=project.git_remote, worker_branch=project.worker_branch, error=None)
     if delivery_id and not state.mark_audit_once(delivery_id, project.project_id, run_id, phase_id):
         state.transition(project.project_id, ProjectState.WAITING_FOR_AUDITOR_GMAIL, {"audit_request_duplicate_suppressed": True})
         return {"duplicate": True, "delivery_message_id": delivery_id, "state": ProjectState.WAITING_FOR_AUDITOR_GMAIL}
     auditor = ChatGPTWebAuditorAdapter(Path(os.environ.get("LOCALAPPDATA", ".")) / "CodexOrchestrator" / "profiles" / "chatgpt", 60)
-    auditor.send_audit_request(project, event, delivery_id or "local-verified")
+    auditor.send_audit_request(project, event, delivery_id or "local-verified", audit_request=audit_request)
     state.transition(project.project_id, ProjectState.WAITING_FOR_AUDITOR_GMAIL, {"audit_request_sent": True})
     ensured = service(argparse.Namespace(action="ensure"))
     if not ensured.get("running"):
@@ -363,7 +416,7 @@ def supervise_once() -> list[dict]:
                 if state.is_processed(event.gmail_message_id, project.project_id):
                     continue
                 ready = ProjectState.CORRECTIVE_READY if event.event_type == EventType.CORRECTIVE else ProjectState.TASK_READY
-                state.transition(project.project_id, ready, {"gmail_instruction": True}, run_id=event.run_id, round_id=event.round_id, last_gmail_id=event.gmail_message_id, active_event_round_id=event.round_id, active_event_type=str(event.event_type), active_event_gmail_id=event.gmail_message_id)
+                state.transition(project.project_id, ready, {"gmail_instruction": True}, run_id=event.run_id, round_id=event.round_id, last_gmail_id=event.gmail_message_id, active_event_round_id=event.round_id, active_event_type=str(event.event_type), active_event_gmail_id=event.gmail_message_id, active_event_payload_json=json.dumps(event.payload, sort_keys=True, default=str))
                 state.transition(project.project_id, ProjectState.WORKER_RUNNING, {"bounded_resume": True})
                 worker = CodexWorkerAdapter(None, package_root); codex_probe = worker.preflight()
                 session = worker.run_instruction(project, json.dumps(event.payload, sort_keys=True), registration.persistent_codex_session)
@@ -499,6 +552,8 @@ def _service_status(paths: dict[str, Path]) -> dict[str, object]:
             heartbeat_age = None
     certified = bool(alive and _owned_record(record) and identity_ready and identity_heartbeat
                      and heartbeat_age is not None and heartbeat_age <= SERVICE_HEARTBEAT_MAX_AGE_SECONDS)
+    stop = _read_json(paths["stop"])
+    stopping = bool(certified and _same_identity(stop, record))
     if record and not alive and (_owned_record(record) or record.get("legacy")):
         _cleanup_owned_artifacts(paths, record)
         if record.get("legacy"):
@@ -507,7 +562,9 @@ def _service_status(paths: dict[str, Path]) -> dict[str, object]:
         pid = None
     result: dict[str, object] = {"running": certified, "pid": pid if certified else None}
     if certified:
-        result.update({"generation": record["generation"], "heartbeat_age_seconds": round(heartbeat_age or 0.0, 3)})
+        result.update({"generation": record["generation"], "heartbeat_age_seconds": round(heartbeat_age or 0.0, 3), "stopping": stopping})
+        if stopping:
+            result["stop_requested"] = True
     elif record and pid and alive:
         # A live but uncertified PID is never overwritten or killed blindly.
         result["detail"] = "live supervisor metadata is not ready or is not AgentRelay-owned"
@@ -518,18 +575,26 @@ def _service_status(paths: dict[str, Path]) -> dict[str, object]:
 def _heartbeat_loop(paths: dict[str, Path], record: dict[str, object], stop_event: threading.Event) -> None:
     """Publish liveness independently of synchronous orchestration work.
 
-    The writer is deliberately limited to service metadata.  It stops as soon
-    as the PID/generation record is replaced or a cooperative stop is owned by
-    this generation, so a stale supervisor cannot revive its heartbeat.
+    The writer is deliberately limited to service metadata. It continues
+    publishing while a cooperative stop is being handled so callers can
+    distinguish a bounded STOPPING state from a stale or crashed supervisor.
     """
     while not stop_event.is_set():
         current = _read_pid_record(paths["pid"])
-        stop = _read_json(paths["stop"])
-        owns_process = _record_pid(record) == os.getpid() and _pid_alive(os.getpid())
-        if not _same_identity(current, record) or _same_identity(stop, record) or not owns_process:
+        # The heartbeat thread runs inside the supervisor whose PID is already
+        # bound to this record. Re-querying the Windows process handle here can
+        # transiently fail under detached-process policy; PID ownership plus
+        # generation ownership is the authoritative check for this thread.
+        owns_process = _record_pid(record) == os.getpid()
+        if not _same_identity(current, record) or not owns_process:
             return
         heartbeat = record | {"heartbeat_epoch": time.time(), "heartbeat_at": datetime.now(UTC).isoformat()}
-        _atomic_json_write(paths["heartbeat"], heartbeat)
+        try:
+            _atomic_json_write(paths["heartbeat"], heartbeat)
+        except OSError:
+            # A transient Windows file-sharing collision must not kill the
+            # liveness publisher. The next interval retries the same update.
+            pass
         if stop_event.wait(SERVICE_HEARTBEAT_INTERVAL_SECONDS):
             return
 
@@ -618,10 +683,16 @@ def service(args: argparse.Namespace) -> dict:
         _diag("service_stop_requested", pid=pid, generation=record["generation"])
         deadline = time.monotonic() + SERVICE_STOP_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
-            if not _service_status(paths)["running"]:
+            _service_status(paths)
+            current_record = _read_pid_record(paths["pid"])
+            if not current_record or not _record_pid(current_record) or not _pid_alive(_record_pid(current_record)):
+                _cleanup_owned_artifacts(paths, record)
                 return {"running": False, "pid": None, "stop_requested": True}
             time.sleep(SERVICE_POLL_SECONDS)
-        raise HumanRequired("HUMAN_REQUIRED\nmissing_field = supervisor_stop\ndetail = supervisor did not acknowledge the stop request")
+        current = _service_status(paths)
+        if current.get("running"):
+            return current | {"stop_requested": True, "stopping": True}
+        return {"running": False, "pid": None, "stop_requested": True}
     if args.action == "start":
         token = _acquire_service_lock(paths)
         try:

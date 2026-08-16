@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .adapters import ChatGPTWebAuditorAdapter, CodexWorkerAdapter, DummyGmailDeliveryAdapter, GitDeliveryAdapter, GmailInstructionBus, HumanRequired
+from .audit_provenance import build_audit_request, build_audit_replay_request
 from .config import ProjectRegistry
 from .models import EventType, OrchestratorEvent, ProjectState
 from .state import StateStore
@@ -90,8 +91,30 @@ class Orchestrator:
         if not self.store.mark_audit_once(delivery_id, project_id, record["run_id"], record["round_id"]):
             self.store.transition(project_id, ProjectState.WAITING_FOR_AUDITOR_GMAIL, {"audit_request_duplicate_suppressed": True})
             return
+        stored_provenance = raw.get("audit_provenance")
+        if stored_provenance:
+            from .global_cli import source_identity
+            audit_request = build_audit_replay_request(
+                original_provenance=stored_provenance,
+                delivery_payload=event.payload,
+                delivery_message_id=delivery_id,
+                agentrelay_audit_transport_identity=source_identity(),
+            )
+        else:
+            audit_request = build_audit_request(
+                project_id=project_id,
+                run_id=record["run_id"],
+                round_id=record["round_id"],
+                active_event_type=record.get("active_event_type") or "UNKNOWN",
+                active_event_gmail_id=record.get("active_event_gmail_id"),
+                active_event_payload=json.loads(record.get("active_event_payload_json") or "{}"),
+                delivery_message_id=delivery_id,
+                delivery_payload=event.payload,
+                agentrelay_delivery_identity=None,
+                legacy_provenance=True,
+            )
         try:
-            self.auditor.send_audit_request(project, event, delivery_id)
+            self.auditor.send_audit_request(project, event, delivery_id, audit_request=audit_request)
         except HumanRequired as exc:
             self.store.transition(project_id, ProjectState.HUMAN_REQUIRED, {"auditor_error": str(exc)}, error=str(exc)); raise
         self.store.transition(project_id, ProjectState.WAITING_FOR_AUDITOR_GMAIL, {"audit_request_sent": True, "resumed": True})
@@ -126,14 +149,14 @@ class Orchestrator:
         if event.event_type not in (EventType.TASK, EventType.CORRECTIVE): return
         terminal_payload = event.payload.get("payload", event.payload)
         if event.event_type == EventType.TASK and terminal_payload.get("action") == "COMPLETE":
-            self.store.transition(project_id, ProjectState.COMPLETE, {"terminal_control": True, "do_not_invoke_worker": True}, round_id=event.round_id, last_gmail_id=event.gmail_message_id, error=None)
+            self.store.transition(project_id, ProjectState.COMPLETE, {"terminal_control": True, "do_not_invoke_worker": True}, run_id=event.run_id, round_id=event.round_id, last_gmail_id=event.gmail_message_id, active_event_round_id=event.round_id, active_event_type=str(event.event_type), active_event_gmail_id=event.gmail_message_id, active_event_payload_json=json.dumps(event.payload, sort_keys=True, default=str), error=None)
             return
         numeric_round = int(event.round_id[1:4]) if event.round_id.startswith("R") and event.round_id[1:4].isdigit() else 0
         if numeric_round > project.max_rounds:
             self.store.transition(project_id, ProjectState.ERROR, {"max_rounds": project.max_rounds}, error="Maximum dummy rounds exceeded")
             return
         next_state = ProjectState.CORRECTIVE_PENDING if event.event_type == EventType.CORRECTIVE else ProjectState.WORKER_RUNNING
-        self.store.transition(project_id, next_state, {"event_type": event.event_type}, round_id=event.round_id, last_gmail_id=event.gmail_message_id)
+        self.store.transition(project_id, next_state, {"event_type": event.event_type}, round_id=event.round_id, last_gmail_id=event.gmail_message_id, active_event_round_id=event.round_id, active_event_type=str(event.event_type), active_event_gmail_id=event.gmail_message_id, active_event_payload_json=json.dumps(event.payload, sort_keys=True, default=str))
         session = self.worker.run_dummy_task(project, event.run_id, event.round_id, record["worker_session_id"])
         self.store.transition(project_id, ProjectState.WAITING_FOR_DELIVERY, {"worker_complete": True}, worker_session_id=session)
         corrected = event.event_type == EventType.CORRECTIVE
@@ -141,15 +164,31 @@ class Orchestrator:
             gmail_id, delivery = self.git_delivery.deliver(project, event.run_id, event.round_id, task_id=event.payload.get("task_id"), phase_id=event.payload.get("phase_id"))
         else:
             gmail_id, delivery = self.delivery.deliver(project, event.run_id, event.round_id, corrected)
+        if "agentrelay_delivery_identity" not in delivery.payload:
+            from .global_cli import source_identity
+            delivery = OrchestratorEvent(delivery.project_id, delivery.run_id, delivery.round_id, delivery.event_type,
+                                         delivery.payload | {"agentrelay_delivery_identity": source_identity()}, delivery.gmail_message_id)
         delivery = OrchestratorEvent(delivery.project_id, delivery.run_id, delivery.round_id, delivery.event_type, delivery.payload, gmail_id)
-        if not self.store.mark_delivery_once(gmail_id, project_id, event.run_id, event.round_id): return
-        self._artifact(project_id, event.round_id, "delivery.json", {"gmail_message_id": gmail_id, "event": delivery.__dict__})
+        audit_request = build_audit_request(
+            project_id=project_id,
+            run_id=event.run_id,
+            round_id=event.round_id,
+            active_event_type=str(event.event_type),
+            active_event_gmail_id=event.gmail_message_id,
+            active_event_payload=event.payload,
+            delivery_message_id=gmail_id,
+            delivery_payload=delivery.payload,
+            agentrelay_delivery_identity=delivery.payload.get("agentrelay_delivery_identity"),
+            agentrelay_audit_transport_identity=delivery.payload.get("agentrelay_delivery_identity"),
+        )
+        if not self.store.mark_delivery_once(gmail_id, project_id, event.run_id, event.round_id, provenance=audit_request["AUDIT_PROVENANCE"]): return
+        self._artifact(project_id, event.round_id, "delivery.json", {"gmail_message_id": gmail_id, "event": delivery.__dict__, "audit_provenance": audit_request["AUDIT_PROVENANCE"]})
         self.store.transition(project_id, ProjectState.AUDIT_PENDING, {"delivery_message_id": gmail_id})
         if not self.store.mark_audit_once(gmail_id, project_id, event.run_id, event.round_id):
             self.store.transition(project_id, ProjectState.WAITING_FOR_AUDITOR_GMAIL, {"audit_request_duplicate_suppressed": True})
             return
         try:
-            self.auditor.send_audit_request(project, delivery, gmail_id)
+            self.auditor.send_audit_request(project, delivery, gmail_id, audit_request=audit_request)
         except HumanRequired as exc:
             self.store.transition(project_id, ProjectState.HUMAN_REQUIRED, {"auditor_error": str(exc)}, error=str(exc))
             raise

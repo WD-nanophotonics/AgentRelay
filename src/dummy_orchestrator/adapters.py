@@ -15,7 +15,7 @@ import ctypes
 from ctypes import wintypes
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from .models import EventType, OrchestratorEvent, ProjectConfig
 from .process_policy import run_hidden, spawn_background
@@ -243,11 +243,15 @@ class GitDeliveryAdapter:
                 "baseline_sha": baseline_sha, "local_sha": local_sha, "delivery_sha": local_sha, "remote_sha": remote_sha,
                 "push_verified": True, "working_tree_clean": True, "timestamp": datetime.now(UTC).isoformat()}
 
-    def deliver(self, project: ProjectConfig, run_id: str, round_id: str, baseline_sha: str | None = None, task_id: str | None = None, phase_id: str | None = None) -> tuple[str | None, OrchestratorEvent]:
+    def deliver(self, project: ProjectConfig, run_id: str, round_id: str, baseline_sha: str | None = None, task_id: str | None = None, phase_id: str | None = None, agentrelay_delivery_identity: dict[str, Any] | None = None) -> tuple[str | None, OrchestratorEvent]:
         payload = self.verify(project, baseline_sha)
+        if agentrelay_delivery_identity is None:
+            from .global_cli import source_identity
+            agentrelay_delivery_identity = source_identity()
         payload.update({"project_id": project.project_id, "run_id": run_id, "task_id": task_id, "phase_id": phase_id or round_id,
                         "attempt": 0, "delivery_type": "GIT_DELIVERY", "evidence_authority": "Git",
                         "gmail_event_type": "DELIVERED",
+                        "agentrelay_delivery_identity": agentrelay_delivery_identity,
                         "instruction": "The worker reports completion. Git delivery has been independently verified. Inspect the repository/delivery directly; do not rely on a worker receipt."})
         event = OrchestratorEvent(project.project_id, run_id, round_id, EventType.DELIVERY, payload)
         if self.bus is None:
@@ -475,16 +479,26 @@ class ChatGPTWebAuditorAdapter:
         finally:
             pw.stop()
 
-    def send_audit_request(self, project: ProjectConfig, event: OrchestratorEvent, delivery_message_id: str) -> None:
-        payload = {"ORCHESTRATOR_AUDIT_REQUEST": True, "project_id": event.project_id, "run_id": event.run_id, "round_id": event.round_id,
-                   "delivery_message_id": delivery_message_id, "target_worker_email": project.worker_email,
-                   **event.payload,
-                   "instruction": ("The worker reports completion. Git delivery has been independently verified. "
-                                   "Inspect the repository/delivery directly; do not rely on a worker receipt. "
-                                   "If accepted, send the next TASK Gmail. If rejected, send a CORRECTIVE Gmail. "
-                                   "If human judgment is required, stop progression."),
-                   "gmail_subject_prefix": project.gmail_subject_prefix,
-                   "AUDITOR_RETURN_PROTOCOL": AUDITOR_RETURN_PROTOCOL}
+    def send_audit_request(self, project: ProjectConfig, event: OrchestratorEvent, delivery_message_id: str, audit_request: dict[str, Any] | None = None) -> None:
+        if audit_request is None:
+            from .audit_provenance import build_audit_request
+            from .global_cli import source_identity
+            audit_request = build_audit_request(
+                project_id=event.project_id,
+                run_id=event.run_id,
+                round_id=event.round_id,
+                active_event_type=str(event.event_type),
+                active_event_gmail_id=None,
+                active_event_payload={},
+                delivery_message_id=delivery_message_id,
+                delivery_payload=event.payload,
+                agentrelay_delivery_identity=event.payload.get("agentrelay_delivery_identity"),
+                agentrelay_audit_transport_identity=source_identity(),
+                legacy_provenance=True,
+            )
+        payload = dict(audit_request)
+        payload.update({"target_worker_email": project.worker_email, "gmail_subject_prefix": project.gmail_subject_prefix,
+                        "AUDITOR_RETURN_PROTOCOL": AUDITOR_RETURN_PROTOCOL})
         self._launch(project.auditor_chat_url)
         pw, browser, _, page = self._attach_page(project.auditor_chat_url)
         try:
